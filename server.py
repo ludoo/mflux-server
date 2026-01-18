@@ -26,6 +26,10 @@ from mflux.models.fibo.variants.txt2img.fibo import FIBO
 from mflux.models.z_image.variants.turbo.z_image_turbo import ZImageTurbo
 
 import requests
+try:
+    from huggingface_hub.errors import GatedRepoError
+except Exception:
+    GatedRepoError = None
 
 # monkey pathing the Session to ignore SSL verification
 old_request = requests.Session.request
@@ -33,6 +37,30 @@ def new_request(self, *args, **kwargs):
     kwargs['verify'] = False
     return old_request(self, *args, **kwargs)
 requests.Session.request = new_request
+
+def _is_gated_repo_error(exc: Exception) -> bool:
+    if GatedRepoError is not None and isinstance(exc, GatedRepoError):
+        return True
+    message = str(exc).lower()
+    return "gatedrepoerror" in message or "gated repo" in message or "access to model" in message and "restricted" in message
+
+def _hf_cache_root() -> str:
+    cache_dir = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if cache_dir:
+        return cache_dir
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        return os.path.join(hf_home, "hub")
+    return os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+
+def _hf_repo_cache_path(repo_id: str) -> str:
+    return os.path.join(_hf_cache_root(), f"models--{repo_id.replace('/', '--')}")
+
+def _hf_repo_cached(repo_id: str) -> bool:
+    try:
+        return os.path.isdir(_hf_repo_cache_path(repo_id))
+    except Exception:
+        return False
 
 app = Flask(__name__)
 api = Api(app, version='1.0', title='MFLUX API Server',
@@ -64,7 +92,9 @@ MODEL_REGISTRY = {
     "briaai/Fibo-mlx-4bit": {"loader": "fibo", "steps": 25},
     "briaai/Fibo-mlx-8bit": {"loader": "fibo", "steps": 25},
     "z-image-turbo": {"loader": "z-image", "steps": 9},
-    "filipstrand/Z-Image-Turbo-mflux-4bit": {"loader": "z-image", "steps": 9}
+    "filipstrand/Z-Image-Turbo-mflux-4bit": {"loader": "z-image", "steps": 9},
+    "black-forest-labs/FLUX.2-klein-9B": {"loader": "flux", "steps": 4},
+    "black-forest-labs/FLUX.2-klein-4B": {"loader": "flux", "steps": 4}
 }
 
 def load_model(model_name: str, quantize: int | None):
@@ -111,7 +141,22 @@ def load_model_runtime(model_name: str, quantize: int | None):
         raise ValueError(f"Unknown model '{model_name}'")
     info = MODEL_REGISTRY.get(model_name, {})
     effective_quantize = quantize if quantize is not None else info.get("quantize")
+    repo_id = model_name if "/" in model_name else None
+    cache_before = _hf_repo_cached(repo_id) if repo_id else None
+    start_time = time.time()
+    print(f"Model load started: '{model_name}'")
     loaded_instance = load_model(model_name, effective_quantize)
+    elapsed = time.time() - start_time
+    if repo_id:
+        if cache_before:
+            source_note = "from cache"
+        elif _hf_repo_cached(repo_id):
+            source_note = "downloaded"
+        else:
+            source_note = "cache status unknown"
+        print(f"Model load finished: '{model_name}' in {elapsed:.2f}s ({source_note})")
+    else:
+        print(f"Model load finished: '{model_name}' in {elapsed:.2f}s")
     with model_lock:
         model = model_name
         model_quantize = effective_quantize
@@ -271,19 +316,23 @@ class LoadModel(Resource):
         args = request.json or {}
         requested_model = args.get('model')
         if not requested_model:
-            return jsonify({"error": "model is required"}), 400
+            return {"error": "model is required"}, 400
         requested_quantize = args.get('quantize', None)
         try:
             if requested_quantize is not None:
                 requested_quantize = int(requested_quantize)
             load_model_runtime(requested_model, requested_quantize)
         except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
-        return jsonify({
+            return {"error": str(exc)}, 400
+        except Exception as exc:
+            if _is_gated_repo_error(exc):
+                return {"error": "Model access appears gated; login to Hugging Face is required."}, 401
+            raise
+        return {
             "model": model,
             "quantize": model_quantize,
             "default_steps": MODEL_REGISTRY.get(model, {}).get("steps", 4)
-        })
+        }
     
 @api.route('/generate')
 class GenerateImage(Resource):
