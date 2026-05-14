@@ -20,10 +20,12 @@ from flask import Flask, request, Response, jsonify
 from flask_restx import Api, Resource, fields
 from flask_cors import CORS
 from flask import send_file, redirect
+from mflux.models.common.config import ModelConfig
 from mflux.models.flux.variants.txt2img.flux import Flux1
 from mflux.models.qwen.variants.txt2img.qwen_image import QwenImage
 from mflux.models.fibo.variants.txt2img.fibo import FIBO
-from mflux.models.z_image.variants.turbo.z_image_turbo import ZImageTurbo
+from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
+from mflux.models.z_image.variants.z_image import ZImage
 
 import requests
 try:
@@ -76,7 +78,7 @@ model_instance = None # the model object, initialized in main()
 pixels = 1024 * 1024  # the number of pixels in all of the computed images (start value)
 ctime = 80            # the total computation time for all images in seconds (start value)
 metal_cache_limit = 0 # the cache limit for the metal library
-model = "dhairyashil/FLUX.1-schnell-mflux-v0.6.2-4bit" # default model
+model = "black-forest-labs/FLUX.2-klein-9B" # default model
 model_quantize = None # quantization level in use
 model_lock = threading.Lock()
 MODEL_REGISTRY = {
@@ -93,9 +95,21 @@ MODEL_REGISTRY = {
     "briaai/Fibo-mlx-8bit": {"loader": "fibo", "steps": 25},
     "z-image-turbo": {"loader": "z-image", "steps": 9},
     "filipstrand/Z-Image-Turbo-mflux-4bit": {"loader": "z-image", "steps": 9},
-    "black-forest-labs/FLUX.2-klein-9B": {"loader": "flux", "steps": 4},
-    "black-forest-labs/FLUX.2-klein-4B": {"loader": "flux", "steps": 4}
+    "flux2-klein-9b": {"loader": "flux2", "steps": 4},
+    "black-forest-labs/FLUX.2-klein-9B": {"loader": "flux2", "steps": 4},
+    "flux2-klein-4b": {"loader": "flux2", "steps": 4},
+    "black-forest-labs/FLUX.2-klein-4B": {"loader": "flux2", "steps": 4}
 }
+
+FLUX2_NAME_MAP = {
+    "black-forest-labs/flux.2-klein-9b": "flux2-klein-9b",
+    "black-forest-labs/flux.2-klein-4b": "flux2-klein-4b"
+}
+
+def _normalize_flux2_model_name(model_name: str) -> str:
+    normalized = model_name.strip()
+    mapped = FLUX2_NAME_MAP.get(normalized.lower())
+    return mapped or normalized
 
 def load_model(model_name: str, quantize: int | None):
     info = MODEL_REGISTRY.get(model_name, {})
@@ -104,12 +118,25 @@ def load_model(model_name: str, quantize: int | None):
     model_path = model_name if "/" in model_name else None
     if loader == "flux":
         return Flux1.from_name(quantize=effective_quantize, model_name=model_name)
+    if loader == "flux2":
+        if Flux2Klein is None:
+            raise ValueError("Flux2 loader not available. Upgrade mflux to a version that includes flux2 support.")
+        normalized_name = _normalize_flux2_model_name(model_name)
+        return Flux2Klein(
+            model_config=ModelConfig.from_name(model_name=normalized_name),
+            quantize=effective_quantize,
+            model_path=model_path,
+        )
     if loader == "qwen":
         return QwenImage(quantize=effective_quantize, model_path=model_path)
     if loader == "fibo":
         return FIBO(quantize=effective_quantize, model_path=model_path)
     if loader == "z-image":
-        return ZImageTurbo(quantize=effective_quantize, model_path=model_path)
+        return ZImage(
+            model_config=ModelConfig.from_name(model_name="z-image-turbo"),
+            quantize=effective_quantize,
+            model_path=model_path,
+        )
     raise ValueError(f"Unknown model loader for '{model_name}'")
 
 def generate_with_model(instance, model_name: str, task, init_image_path):
@@ -123,7 +150,7 @@ def generate_with_model(instance, model_name: str, task, init_image_path):
         except json.JSONDecodeError:
             prompt = json.dumps({"prompt": prompt})
     common_kwargs = {
-        "seed": task['seed'],
+        "seed": int(task['seed']),
         "prompt": prompt,
         "num_inference_steps": steps,
         "height": task['height'],
@@ -131,7 +158,7 @@ def generate_with_model(instance, model_name: str, task, init_image_path):
         "image_path": init_image_path,
         "image_strength": 0.4 if init_image_path else None
     }
-    if info.get("loader") == "z-image":
+    if info.get("loader") in ["z-image", "flux2"]:
         return instance.generate_image(**common_kwargs)
     return instance.generate_image(**common_kwargs, guidance=guidance)
 
@@ -145,7 +172,13 @@ def load_model_runtime(model_name: str, quantize: int | None):
     cache_before = _hf_repo_cached(repo_id) if repo_id else None
     start_time = time.time()
     print(f"Model load started: '{model_name}'")
-    loaded_instance = load_model(model_name, effective_quantize)
+    try:
+        loaded_instance = load_model(model_name, effective_quantize)
+    except Exception as exc:
+        elapsed = time.time() - start_time
+        exc_name = exc.__class__.__name__
+        print(f"Model load failed: '{model_name}' in {elapsed:.2f}s ({exc_name}: {exc})")
+        raise
     elapsed = time.time() - start_time
     if repo_id:
         if cache_before:
@@ -185,6 +218,7 @@ def compute_image_task():
         with model_lock:
             current_model_instance = model_instance
             current_model_name = model
+            current_model_quantize = model_quantize
         if current_model_instance == None or len(tasklist) == 0:
             time.sleep(1)
             continue
@@ -199,6 +233,8 @@ def compute_image_task():
             # generate the image
             _set_mlx_cache_limit(metal_cache_limit)
             init_image = task['init_image']
+            task['model_used'] = current_model_name
+            task['quantize_used'] = current_model_quantize
             
             # make a temporary file path for the init_image
             if init_image:
@@ -268,7 +304,9 @@ task_model = api.model('TaskInput', {
 generate_response_model = api.model('GenerateResponse', {
     'task_id': fields.String(description='ID of the image generation task'),
     'task_length': fields.Integer(description='Length of the image generation task queue excluding this new one'),
-    'expected_time_seconds': fields.Float(description='Expected time in seconds for the image generation task to complete')
+    'expected_time_seconds': fields.Float(description='Expected time in seconds for the image generation task to complete'),
+    'model': fields.String(description='Model in use when the task was queued'),
+    'quantize': fields.Integer(description='Quantization level in use when the task was queued')
 })
 
 # function which counts number of pixels in images from the tasklist up to a certain index
@@ -359,6 +397,9 @@ class GenerateImage(Resource):
         format = args.get('format', 'JPEG').upper()
         quality = args.get('quality', 85)
         priority = args.get('priority', False)
+        with model_lock:
+            model_at_submit = model
+            quantize_at_submit = model_quantize
 
         # Decode init_image if it is provided
         init_image = None
@@ -389,7 +430,9 @@ class GenerateImage(Resource):
             'quality': quality,
             'priority': priority,
             'start_time': start_time,
-            'init_image': init_image
+            'init_image': init_image,
+            'model_at_submit': model_at_submit,
+            'quantize_at_submit': quantize_at_submit
         }
         
         # compute waiting time based on the number of pixels in the queue
@@ -405,7 +448,9 @@ class GenerateImage(Resource):
         return {
             'task_id': task_id,
             'task_length': len(tasklist) - 1,
-            'expected_time_seconds': expected_time_seconds
+            'expected_time_seconds': expected_time_seconds,
+            'model': model_at_submit,
+            'quantize': quantize_at_submit
         }, 200
 
 status_model = api.model('Status', {
