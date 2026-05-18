@@ -87,7 +87,7 @@ def poll(task_id, _):
 
 
 def build_ui():
-    with gr.Blocks(title="Diffusion Studio", theme=gr.themes.Soft()) as app:
+    with gr.Blocks(title="Diffusion Studio") as app:
         gr.Markdown("# Diffusion Studio")
         gr.Markdown(f"Engine: `{ENDPOINT}`  |  Swagger: [{ENDPOINT}/swagger]({ENDPOINT}/swagger)")
 
@@ -133,11 +133,14 @@ def build_ui():
             fn=lambda tid: gr.update(value=""),
             inputs=[],
             outputs=[output_image],
-        ).then(
+        )
+
+        # Poll every 3 seconds while task is active
+        timer = gr.Timer(3)
+        timer.tick(
             fn=poll,
             inputs=[task_id, output_image],
             outputs=[status_text, output_image],
-            every=3,
         )
 
         # When done, add to gallery
@@ -150,6 +153,10 @@ def build_ui():
     return app
 
 
-if __name__ == "__main__":
+def launch():
     port = int(os.environ.get("MFLUX_UI_PORT", "7860"))
-    build_ui().launch(server_name="0.0.0.0", server_port=port)
+    build_ui().launch(server_name="0.0.0.0", server_port=port, theme=gr.themes.Soft())
+
+
+if __name__ == "__main__":
+    launch()
