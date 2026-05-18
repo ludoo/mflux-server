@@ -95,9 +95,7 @@ def build_ui():
 
             with gr.Column(scale=1):
                 task_id = gr.Textbox(label="Task ID")
-                with gr.Row():
-                    check_btn = gr.Button("Check Status")
-                    auto_poll = gr.Checkbox(label="Auto-poll (3s)", value=True)
+                check_btn = gr.Button("Check Status")
                 status = gr.Markdown("")
                 output = gr.Image(label="Generated Image", type="pil", height=450, interactive=False)
                 gallery = gr.Gallery(label="History", columns=2, height=400, object_fit="contain", interactive=False)
@@ -105,24 +103,6 @@ def build_ui():
         submit_btn.click(submit, [prompt, mode, init_file, edit_files, steps, width, height, seed],
                          [task_id, status, output])
         check_btn.click(check, [task_id], [status, output])
-
-        # Auto-poll timer — ticks every 3s, only calls check() with current task_id
-        timer = gr.Timer(3, active=False)
-
-        def poll_if_active(active, tid):
-            if not active or not tid:
-                return "", None
-            return check(tid)
-
-        timer.tick(poll_if_active, [auto_poll, task_id], [status, output])
-
-        def on_done_or_stop(status_text, active):
-            """Stop polling when done or user unchecks."""
-            if status_text and status_text.startswith("Done"):
-                return gr.update(active=False), False
-            return gr.update(active=active), active
-
-        status.change(on_done_or_stop, [status, auto_poll], [timer, auto_poll])
         output.change(lambda img, gal: (gal or []) + [(img, "")] if img else (gal or []),
                       [output, gallery], [gallery])
 
