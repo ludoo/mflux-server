@@ -25,6 +25,7 @@ from mflux.models.flux.variants.txt2img.flux import Flux1
 from mflux.models.qwen.variants.txt2img.qwen_image import QwenImage
 from mflux.models.fibo.variants.txt2img.fibo import FIBO
 from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
+from mflux.models.flux2.variants.edit.flux2_klein_edit import Flux2KleinEdit
 from mflux.models.z_image.variants.z_image import ZImage
 
 import requests
@@ -75,6 +76,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 apppath = os.path.dirname(__file__)
 tasklist = []         # list which holds the image computation tasks
 model_instance = None # the model object, initialized in main()
+model_edit_instance = None # edit variant (Flux2KleinEdit), loaded on demand
 pixels = 1024 * 1024  # the number of pixels in all of the computed images (start value)
 ctime = 80            # the total computation time for all images in seconds (start value)
 metal_cache_limit = 0 # the cache limit for the metal library
@@ -97,7 +99,8 @@ MODEL_REGISTRY = {
     "filipstrand/Z-Image-Turbo-mflux-4bit": {"loader": "z-image", "steps": 9},
     "flux2-klein-9b": {"loader": "flux2", "steps": 4},
     "black-forest-labs/FLUX.2-klein-9B": {"loader": "flux2", "steps": 4},
-    "flux2-klein-4b": {"loader": "flux2", "steps": 4},
+    "flux2-klein-9b-edit": {"loader": "flux2-edit", "steps": 4},
+    "flux2-klein-4b-edit": {"loader": "flux2-edit", "steps": 4},
     "black-forest-labs/FLUX.2-klein-4B": {"loader": "flux2", "steps": 4}
 }
 
@@ -132,6 +135,26 @@ def _register_local_models(local_models_arg: list[str] | None) -> None:
         print(f"Registered local model '{name}' -> {path} (based on '{key}')")
 
 
+def _make_edit_variant(txt2img_instance):
+    """Create a Flux2KleinEdit sharing weights with an existing Flux2Klein instance.
+    No reload — shares the same MLX arrays in GPU memory."""
+    from mlx import nn as mlx_nn
+    edit = Flux2KleinEdit.__new__(Flux2KleinEdit)
+    mlx_nn.Module.__init__(edit)
+    edit.vae = txt2img_instance.vae
+    edit.transformer = txt2img_instance.transformer
+    edit.text_encoder = txt2img_instance.text_encoder
+    edit.model_config = txt2img_instance.model_config
+    edit.tokenizers = txt2img_instance.tokenizers
+    edit.bits = txt2img_instance.bits
+    edit.callbacks = txt2img_instance.callbacks
+    edit.tiling_config = txt2img_instance.tiling_config
+    edit.prompt_cache = txt2img_instance.prompt_cache
+    edit.lora_paths = getattr(txt2img_instance, 'lora_paths', None)
+    edit.lora_scales = getattr(txt2img_instance, 'lora_scales', None)
+    return edit
+
+
 def load_model(model_name: str, quantize: int | None):
     info = MODEL_REGISTRY.get(model_name, {})
     loader = info.get("loader")
@@ -144,6 +167,15 @@ def load_model(model_name: str, quantize: int | None):
             raise ValueError("Flux2 loader not available. Upgrade mflux to a version that includes flux2 support.")
         normalized_name = _normalize_flux2_model_name(model_name)
         return Flux2Klein(
+            model_config=ModelConfig.from_name(model_name=normalized_name),
+            quantize=effective_quantize,
+            model_path=model_path,
+        )
+    if loader == "flux2-edit":
+        if Flux2KleinEdit is None:
+            raise ValueError("Flux2KleinEdit not available. Upgrade mflux.")
+        normalized_name = _normalize_flux2_model_name(model_name)
+        return Flux2KleinEdit(
             model_config=ModelConfig.from_name(model_name=normalized_name),
             quantize=effective_quantize,
             model_path=model_path,
@@ -182,6 +214,18 @@ def generate_with_model(instance, model_name: str, task, init_image_path):
     if info.get("loader") in ["z-image", "flux2"]:
         return instance.generate_image(**common_kwargs)
     return instance.generate_image(**common_kwargs, guidance=guidance)
+
+def generate_edit(edit_instance, task, init_image_paths):
+    """Generate using Flux2KleinEdit with multiple reference images."""
+    steps = task.get('steps') or 4
+    return edit_instance.generate_image(
+        seed=int(task['seed']),
+        prompt=task['prompt'],
+        num_inference_steps=steps,
+        height=task['height'],
+        width=task['width'],
+        image_paths=init_image_paths,
+    )
 
 def load_model_runtime(model_name: str, quantize: int | None):
     global model_instance, model, model_quantize
@@ -234,11 +278,12 @@ def _clear_mlx_cache() -> None:
 
 
 def compute_image_task():
-    global model_instance, tasklist, pixels, ctime
+    global model_instance, model_edit_instance, tasklist, pixels, ctime
     # we loop forever and in every iteration we check if there is a task to process
     while True:
         with model_lock:
             current_model_instance = model_instance
+            current_edit_instance = model_edit_instance
             current_model_name = model
             current_model_quantize = model_quantize
         if current_model_instance == None or len(tasklist) == 0:
@@ -248,27 +293,41 @@ def compute_image_task():
         # loop through the tasklist and get the first task which has no image assigned
         foundimage = False
         for task in tasklist:
-            if 'image' in task: continue          
+            if 'image' in task: continue
+            is_edit = task.get('mode') == 'edit'
+            
+            if is_edit and current_edit_instance is None:
+                continue  # skip edit tasks if no edit instance
+            
             # found a task without image
             compute_time = time.time()
             task['compute_time'] = compute_time
-            # generate the image
             _set_mlx_cache_limit(metal_cache_limit)
-            init_image = task['init_image']
             task['model_used'] = current_model_name
             task['quantize_used'] = current_model_quantize
-            
-            # make a temporary file path for the init_image
-            if init_image:
-                init_image_path = Path(f"/tmp/init_image_{task['task_id']}.png")
-                init_image.save(str(init_image_path))
+
+            if is_edit:
+                # Multi-image editing
+                init_images = task.get('init_images', [])
+                init_image_paths = []
+                for i, img in enumerate(init_images):
+                    p = Path(f"/tmp/edit_{task['task_id']}_{i}.png")
+                    img.save(str(p))
+                    init_image_paths.append(p)
+                generated_image = generate_edit(current_edit_instance, task, init_image_paths)
+                for p in init_image_paths:
+                    os.remove(p)
             else:
-                init_image_path = None
-
-            generated_image = generate_with_model(current_model_instance, current_model_name, task, init_image_path)
-
-            # remove the temporary init_image file
-            if init_image_path: os.remove(init_image_path)
+                # txt2img / img2img
+                init_image = task.get('init_image')
+                if init_image:
+                    init_image_path = Path(f"/tmp/init_image_{task['task_id']}.png")
+                    init_image.save(str(init_image_path))
+                else:
+                    init_image_path = None
+                generated_image = generate_with_model(current_model_instance, current_model_name, task, init_image_path)
+                if init_image_path:
+                    os.remove(init_image_path)
 
             # statistics
             end_time = time.time()
@@ -595,6 +654,92 @@ class ClearTasks(Resource):
         tasklist.clear()
         return Response(status=200)
 
+edit_model = api.model('EditInput', {
+    'prompt': fields.String(description='The textual description of the image to generate.', required=True),
+    'seed': fields.String(description='Entropy Seed', default=str(int(time.time())), required=False),
+    'height': fields.Integer(description='Image height', default=1024, required=False),
+    'width': fields.Integer(description='Image width', default=1024, required=False),
+    'steps': fields.Integer(description='Inference Steps', default=4, required=False),
+    'init_images': fields.List(fields.String, description='Base64-encoded reference images', required=True),
+    'format': fields.String(description='Image format (JPEG or PNG)', default="JPEG", required=False),
+    'quality': fields.Integer(description='JPEG quality (1-100)', default=85, required=False),
+    'priority': fields.Boolean(description='Put task at head of queue', default=False, required=False)
+})
+
+@api.route('/edit')
+class EditImage(Resource):
+    @api.expect(edit_model, validate=True)
+    @api.response(200, 'Success', generate_response_model)
+    def post(self):
+        """
+        The /edit endpoint generates an image with multiple reference images
+        using Flux2KleinEdit (multi-image conditioning).
+        """
+        global tasklist, pixels, ctime
+        args = request.json
+        prompt = args.get('prompt', '')
+        seed = args.get('seed', str(int(time.time())))
+        height = int(args.get('height', 1024))
+        width = int(args.get('width', 1024))
+        steps = int(args.get('steps', 4))
+        format = args.get('format', 'JPEG').upper()
+        quality = args.get('quality', 85)
+        priority = args.get('priority', False)
+        with model_lock:
+            model_at_submit = model
+            quantize_at_submit = model_quantize
+
+        # Decode init_images from base64
+        init_images = []
+        for b64 in args.get('init_images', []):
+            try:
+                img_data = base64.b64decode(b64)
+                img = Image.open(io.BytesIO(img_data))
+                init_images.append(img)
+            except Exception:
+                pass
+        if not init_images:
+            return {"error": "At least one valid init_image required"}, 400
+
+        start_time = time.time()
+        md5 = hashlib.md5()
+        md5.update(str(start_time).encode())
+        task_id = md5.hexdigest()[:8]
+
+        task_metadata = {
+            'task_id': task_id,
+            'mode': 'edit',
+            'prompt': prompt,
+            'seed': seed,
+            'height': height,
+            'width': width,
+            'steps': steps,
+            'format': format,
+            'quality': quality,
+            'priority': priority,
+            'start_time': start_time,
+            'init_images': init_images,
+            'model_at_submit': model_at_submit,
+            'quantize_at_submit': quantize_at_submit
+        }
+
+        wait_for_pixels = width * height
+        if priority and len(tasklist) > 1:
+            wait_for_pixels += count_pixels(1)
+            tasklist.insert(1, task_metadata)
+        else:
+            wait_for_pixels += count_pixels(len(tasklist))
+            tasklist.append(task_metadata)
+
+        expected_time_seconds = ctime * wait_for_pixels / pixels
+        return {
+            'task_id': task_id,
+            'task_length': len(tasklist) - 1,
+            'expected_time_seconds': expected_time_seconds,
+            'model': model_at_submit,
+            'quantize': quantize_at_submit
+        }, 200
+
 @app.route('/')
 def redirect_to_index():
     return redirect('/index.html')
@@ -617,12 +762,18 @@ def main():
 
     global model_quantize
     global model_instance
+    global model_edit_instance
     global metal_cache_limit
 
     # Register local models before loading (extends MODEL_REGISTRY)
     _register_local_models(args.local_model)
 
     load_model_runtime(args.model, args.quantize)
+
+    # Create edit variant if the loaded model is Flux2Klein
+    if isinstance(model_instance, Flux2Klein):
+        model_edit_instance = _make_edit_variant(model_instance)
+        print("Edit variant ready (shared weights)")
 
     metal_cache_limit = args.cache_limit
     threading.Thread(target=compute_image_task).start()
