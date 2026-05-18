@@ -106,7 +106,7 @@ def load_history():
 
 def delete_from_history(task_id):
     if not task_id:
-        return [], [], "Enter a task ID"
+        return load_history()[0], load_history()[1], "Enter a task ID"
     try:
         requests.get(f"{ENDPOINT}/api/cancel", params={"task_id": task_id}, timeout=5)
         requests.get(f"{ENDPOINT}/api/image", params={"task_id": task_id, "delete": "true"}, timeout=10)
@@ -115,13 +115,27 @@ def delete_from_history(task_id):
     return load_history()
 
 
+def delete_selected(selected_tid, manual_tid, gallery, meta):
+    tid = selected_tid or manual_tid
+    if not tid:
+        return gallery, meta, "Select a task or enter a Task ID", "", ""
+    try:
+        requests.get(f"{ENDPOINT}/api/cancel", params={"task_id": tid}, timeout=5)
+        requests.get(f"{ENDPOINT}/api/image", params={"task_id": tid, "delete": "true"}, timeout=10)
+    except requests.RequestException:
+        pass
+    items, new_meta, msg = load_history()
+    return items, new_meta, f"Deleted {tid}", "", ""
+
+
 def show_details(evt: gr.SelectData, meta):
     idx = evt.index
     if not meta or idx >= len(meta):
-        return "No details"
+        return "No details", ""
     task = meta[idx]
+    tid = task.get('task_id', '?')
     lines = [
-        f"**Task:** `{task.get('task_id', '?')}`",
+        f"**Task:** `{tid}`",
         f"**Prompt:** {task.get('prompt', '?')}",
         f"**Seed:** {task.get('seed', '?')}",
         f"**Size:** {task.get('width', '?')}×{task.get('height', '?')}",
@@ -129,7 +143,7 @@ def show_details(evt: gr.SelectData, meta):
     ]
     if task.get('model_used'):
         lines.append(f"**Model:** {task['model_used']}")
-    return "\n".join(lines)
+    return "\n".join(lines), tid
 
 
 # ---- UI ----
@@ -172,17 +186,21 @@ def build_ui():
             with gr.Tab("History"):
                 with gr.Row():
                     load_btn = gr.Button("Refresh")
-                    delete_tid = gr.Textbox(label="Task ID to delete", placeholder="Enter task ID")
-                    delete_btn = gr.Button("Delete", variant="stop")
+                    manual_tid = gr.Textbox(label="Task ID", placeholder="Enter or click a thumbnail")
+                    delete_btn = gr.Button("Delete Selected", variant="stop")
                 hist_status = gr.Markdown("")
                 hist_details = gr.Markdown("", visible=False)
                 hist_gallery = gr.Gallery(label="Past Images", columns=3, height=500, object_fit="contain")
                 hist_meta = gr.State([])
+                selected_tid = gr.State("")
 
                 load_btn.click(load_history, [], [hist_gallery, hist_meta, hist_status])
-                delete_btn.click(delete_from_history, [delete_tid], [hist_gallery, hist_meta, hist_status])
-                hist_gallery.select(show_details, [hist_meta], [hist_details]).then(
+                delete_btn.click(delete_selected, [selected_tid, manual_tid, hist_gallery, hist_meta],
+                                [hist_gallery, hist_meta, hist_status, hist_details, manual_tid])
+                hist_gallery.select(show_details, [hist_meta], [hist_details, selected_tid]).then(
                     fn=lambda: gr.update(visible=True), outputs=[hist_details]
+                ).then(
+                    fn=lambda tid: tid, inputs=[selected_tid], outputs=[manual_tid]
                 )
 
     return app
