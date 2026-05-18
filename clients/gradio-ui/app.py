@@ -72,6 +72,64 @@ def check(task_id):
         return f"Error: {e}", None
 
 
+def load_history():
+    """Fetch past tasks from the engine, return gallery + task list."""
+    try:
+        r = requests.get(f"{ENDPOINT}/api/tasks", timeout=10)
+        r.raise_for_status()
+        tasks = r.json().get("tasks", [])
+    except requests.RequestException:
+        return [], [], "Failed to load history"
+
+    items = []
+    meta = []
+    for task in reversed(tasks):
+        tid = task.get("task_id", "?")
+        prompt = task.get("prompt", "")[:80]
+        label = f"{tid}: {prompt}"
+        try:
+            ir = requests.get(f"{ENDPOINT}/api/image", params={"task_id": tid, "delete": "false"}, timeout=10)
+            if ir.status_code == 200:
+                img = Image.open(io.BytesIO(ir.content))
+                items.append((img, label))
+                meta.append(task)
+        except requests.RequestException:
+            pass
+
+    return items, meta, f"{len(meta)} tasks with images"
+
+
+def delete_task(task_id, gallery, meta):
+    """Delete a task from the queue/history."""
+    if not task_id:
+        return "Enter a task ID", gallery, meta
+    try:
+        requests.get(f"{ENDPOINT}/api/cancel", params={"task_id": task_id}, timeout=5)
+        requests.get(f"{ENDPOINT}/api/image", params={"task_id": task_id, "delete": "true"}, timeout=10)
+        items, new_meta, msg = load_history()
+        return f"Deleted {task_id}", items, new_meta
+    except requests.RequestException as e:
+        return f"Error: {e}", gallery, meta
+
+
+def show_details(evt: gr.SelectData, meta):
+    """Show task details when a gallery item is clicked."""
+    idx = evt.index
+    if not meta or idx >= len(meta):
+        return "No details"
+    task = meta[idx]
+    lines = [
+        f"**Task:** `{task.get('task_id', '?')}`",
+        f"**Prompt:** {task.get('prompt', '?')}",
+        f"**Seed:** {task.get('seed', '?')}",
+        f"**Size:** {task.get('width', '?')}×{task.get('height', '?')}",
+        f"**Steps:** {task.get('steps', '?')}",
+    ]
+    if task.get('model_used'):
+        lines.append(f"**Model:** {task['model_used']}")
+    return "\n".join(lines)
+
+
 def build_ui():
     with gr.Blocks(title="Diffusion Studio") as app:
         gr.Markdown("# Diffusion Studio")
@@ -95,14 +153,25 @@ def build_ui():
 
             with gr.Column(scale=1):
                 task_id = gr.Textbox(label="Task ID")
-                check_btn = gr.Button("Check Status")
+                with gr.Row():
+                    check_btn = gr.Button("Check Status")
+                    delete_btn = gr.Button("Delete", variant="stop")
+                    history_btn = gr.Button("Load History")
                 status = gr.Markdown("")
                 output = gr.Image(label="Generated Image", type="pil", height=450, interactive=False)
+                details = gr.Markdown("", visible=False)
                 gallery = gr.Gallery(label="History", columns=2, height=400, object_fit="contain", interactive=False)
+
+        task_state = gr.State([])
 
         submit_btn.click(submit, [prompt, mode, init_file, edit_files, steps, width, height, seed],
                          [task_id, status, output])
         check_btn.click(check, [task_id], [status, output])
+        delete_btn.click(delete_task, [task_id, gallery, task_state], [status, gallery, task_state])
+        history_btn.click(load_history, [], [gallery, task_state, status])
+        gallery.select(show_details, [task_state], [details]).then(
+            fn=lambda: gr.update(visible=True), outputs=[details]
+        )
         output.change(lambda img, gal: (gal or []) + [(img, "")] if img else (gal or []),
                       [output, gallery], [gallery])
 
