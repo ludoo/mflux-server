@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mflux-server</string>
+
+    <key>UserName</key>
+    <string>ludo</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/llm/mflux-server/.venv/bin/python3</string>
+        <string>/opt/llm/mflux-server/server.py</string>
+        <string>--model</string>
+        <string>FLUX.2-klein-9B-MLX-Q8</string>
+        <string>--local-model</string>
+        <string>flux2-klein-9b:/opt/llm/diffusion-mlx/FLUX.2-klein-9B-MLX-Q8</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8030</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/opt/llm/mflux-server</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/opt/homebrew/var/log/mflux-server.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/opt/homebrew/var/log/mflux-server.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Standard</string>
+</dict>
+</plist>
