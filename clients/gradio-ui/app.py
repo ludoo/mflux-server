@@ -83,7 +83,8 @@ def build_ui():
                 prompt = gr.Textbox(label="Prompt", placeholder="Describe the image...", lines=3)
                 init_file = gr.File(label="Init Image (img2img)", file_types=["image"], visible=False)
                 edit_files = gr.File(label="Reference Images (edit)", file_types=["image"], file_count="multiple", visible=False)
-                mode.change(lambda m: (m == "img2img", m == "edit"), mode, [init_file, edit_files])
+                mode.change(lambda m: (gr.update(visible=(m == "img2img")), gr.update(visible=(m == "edit"))),
+                           mode, [init_file, edit_files])
                 with gr.Row():
                     steps = gr.Slider(1, 25, value=4, step=1, label="Steps")
                     width = gr.Slider(256, 2048, value=1024, step=64, label="Width")
