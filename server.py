@@ -372,7 +372,11 @@ class ListModels(Resource):
         """
         The /ls endpoint provides a catalog of available models and defaults.
         """
-        return jsonify(MODEL_REGISTRY)
+        result = dict(MODEL_REGISTRY)
+        if _is_local_path(model):
+            model_key = _infer_model_key_from_path(model)
+            result[model] = MODEL_REGISTRY.get(model_key, {"loader": "unknown", "steps": 4})
+        return jsonify(result)
 
 @api.route('/ps')
 class GetSettings(Resource):
