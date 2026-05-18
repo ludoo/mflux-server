@@ -111,57 +111,38 @@ def _normalize_flux2_model_name(model_name: str) -> str:
     mapped = FLUX2_NAME_MAP.get(normalized.lower())
     return mapped or normalized
 
-def _infer_model_key_from_path(path: str) -> str:
-    """Infer the MODEL_REGISTRY key from a local model directory path."""
-    path_lower = path.lower()
-    # Try exact key match first
-    for key in MODEL_REGISTRY:
-        if key.lower() in path_lower:
-            return key
-    # Try common name variants
-    variant_map = {
-        "flux.2-klein-9b": "flux2-klein-9b",
-        "flux.2-klein-4b": "flux2-klein-4b",
-        "flux.2-klein-base-9b": "flux2-klein-base-9b",
-        "flux.2-klein-base-4b": "flux2-klein-base-4b",
-        "z-image-turbo": "z-image-turbo",
-        "z-image": "z-image",
-        "qwen-image": "qwen-image",
-        "qwen-image-edit": "qwen-image-edit",
-        "fibo": "fibo",
-        "flux.1-schnell": "schnell",
-        "flux.1-dev": "dev",
-    }
-    for variant, key in variant_map.items():
-        if variant in path_lower:
-            return key
-    raise ValueError(
-        f"Cannot infer model type from path: {path}. "
-        f"Name the directory to include a known model name."
-    )
-
-
-def _is_local_path(model_name: str) -> bool:
-    return model_name.startswith(("/", "./", "~/"))
+def _register_local_models(local_models_arg: list[str] | None) -> None:
+    """Register local model aliases from --local-model flag.
+    Format: key:path  (e.g. flux2-klein-9b:/opt/llm/diffusion-mlx/model)
+    Name is derived from basename of path."""
+    if not local_models_arg:
+        return
+    for entry in local_models_arg:
+        key, path = entry.split(":", 1)
+        key = key.strip()
+        path = path.strip()
+        if key not in MODEL_REGISTRY:
+            raise ValueError(f"--local-model: registry key '{key}' not found. Available: {list(MODEL_REGISTRY.keys())}")
+        name = os.path.basename(path)
+        MODEL_REGISTRY[name] = {
+            **MODEL_REGISTRY[key],
+            "_local": True,
+            "_local_path": path,
+        }
+        print(f"Registered local model '{name}' -> {path} (based on '{key}')")
 
 
 def load_model(model_name: str, quantize: int | None):
-    local = _is_local_path(model_name)
-    if local:
-        model_key = _infer_model_key_from_path(model_name)
-        model_path = model_name  # use full path for weight loading
-    else:
-        model_key = model_name
-        model_path = model_name if "/" in model_name else None
-    info = MODEL_REGISTRY.get(model_key, {})
+    info = MODEL_REGISTRY.get(model_name, {})
     loader = info.get("loader")
     effective_quantize = quantize if quantize is not None else info.get("quantize")
+    model_path = info.get("_local_path") or (model_name if "/" in model_name else None)
     if loader == "flux":
         return Flux1.from_name(quantize=effective_quantize, model_name=model_name)
     if loader == "flux2":
         if Flux2Klein is None:
             raise ValueError("Flux2 loader not available. Upgrade mflux to a version that includes flux2 support.")
-        normalized_name = _normalize_flux2_model_name(model_key if local else model_name)
+        normalized_name = _normalize_flux2_model_name(model_name)
         return Flux2Klein(
             model_config=ModelConfig.from_name(model_name=normalized_name),
             quantize=effective_quantize,
@@ -204,16 +185,12 @@ def generate_with_model(instance, model_name: str, task, init_image_path):
 
 def load_model_runtime(model_name: str, quantize: int | None):
     global model_instance, model, model_quantize
-    local = _is_local_path(model_name)
-    if local:
-        model_key = _infer_model_key_from_path(model_name)
-    else:
-        if model_name not in MODEL_REGISTRY:
-            raise ValueError(f"Unknown model '{model_name}'")
-        model_key = model_name
-    info = MODEL_REGISTRY.get(model_key, {})
+    if model_name not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model '{model_name}'")
+    info = MODEL_REGISTRY.get(model_name, {})
     effective_quantize = quantize if quantize is not None else info.get("quantize")
-    repo_id = model_name if "/" in model_name and not local else None
+    is_local = info.get("_local", False)
+    repo_id = model_name if "/" in model_name and not is_local else None
     cache_before = _hf_repo_cached(repo_id) if repo_id else None
     start_time = time.time()
     print(f"Model load started: '{model_name}'")
@@ -372,11 +349,7 @@ class ListModels(Resource):
         """
         The /ls endpoint provides a catalog of available models and defaults.
         """
-        result = dict(MODEL_REGISTRY)
-        if _is_local_path(model):
-            model_key = _infer_model_key_from_path(model)
-            result[model] = MODEL_REGISTRY.get(model_key, {"loader": "unknown", "steps": 4})
-        return jsonify(result)
+        return jsonify(MODEL_REGISTRY)
 
 @api.route('/ps')
 class GetSettings(Resource):
@@ -385,13 +358,11 @@ class GetSettings(Resource):
         """
         The /ps endpoint provides the current server settings and default model.
         """
-        model_key = _infer_model_key_from_path(model) if _is_local_path(model) else model
         return jsonify({
             "model": model,
-            "model_key": model_key,
             "quantize": model_quantize,
             "cache_limit": metal_cache_limit,
-            "default_steps": MODEL_REGISTRY.get(model_key, {}).get("steps", 4)
+            "default_steps": MODEL_REGISTRY.get(model, {}).get("steps", 4)
         })
 
 @api.route('/load')
@@ -634,7 +605,10 @@ def serve_index():
 
 def main():
     parser = argparse.ArgumentParser(description='Start a server to generate images with mflux.')
-    parser.add_argument('--model', type=str, default=model, help='Model name from registry or local path (e.g. /opt/llm/diffusion-mlx/FLUX.2-klein-9B-MLX-Q8)')
+    parser.add_argument('--model', type=str, default=model, help='Model name from registry or a local alias registered via --local-model')
+    parser.add_argument('--local-model', type=str, action='append', default=[],
+                        metavar='KEY:PATH',
+                        help='Register a local model alias (key from registry : local path). Repeatable. Name = basename of path.')
     parser.add_argument('--quantize',  "-q", type=int, choices=[4, 8], default=None, help='Quantize the model (4 or 8, Default is None)')
     parser.add_argument('--host', type=str, default='127.0.0.1', help='The host to listen on')
     parser.add_argument('--port', type=int, default=4030, help='The port to listen on')
@@ -644,6 +618,10 @@ def main():
     global model_quantize
     global model_instance
     global metal_cache_limit
+
+    # Register local models before loading (extends MODEL_REGISTRY)
+    _register_local_models(args.local_model)
+
     load_model_runtime(args.model, args.quantize)
 
     metal_cache_limit = args.cache_limit
