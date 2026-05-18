@@ -25,6 +25,8 @@ def _img_to_b64(path):
         return base64.b64encode(buf.getvalue()).decode()
 
 
+# ---- Generate tab ----
+
 def submit(prompt, mode, init_file, edit_files, steps, width, height, seed):
     try:
         steps_i, width_i, height_i = int(steps), int(width), int(height)
@@ -72,8 +74,9 @@ def check(task_id):
         return f"Error: {e}", None
 
 
+# ---- History tab ----
+
 def load_history():
-    """Fetch past tasks from the engine, return gallery + task list."""
     try:
         r = requests.get(f"{ENDPOINT}/api/tasks", timeout=10)
         r.raise_for_status()
@@ -99,21 +102,18 @@ def load_history():
     return items, meta, f"{len(meta)} tasks with images"
 
 
-def delete_task(task_id, gallery, meta):
-    """Delete a task from the queue/history."""
+def delete_from_history(task_id):
     if not task_id:
-        return "Enter a task ID", gallery, meta
+        return [], [], "Enter a task ID"
     try:
         requests.get(f"{ENDPOINT}/api/cancel", params={"task_id": task_id}, timeout=5)
         requests.get(f"{ENDPOINT}/api/image", params={"task_id": task_id, "delete": "true"}, timeout=10)
-        items, new_meta, msg = load_history()
-        return f"Deleted {task_id}", items, new_meta
-    except requests.RequestException as e:
-        return f"Error: {e}", gallery, meta
+    except requests.RequestException:
+        pass
+    return load_history()
 
 
 def show_details(evt: gr.SelectData, meta):
-    """Show task details when a gallery item is clicked."""
     idx = evt.index
     if not meta or idx >= len(meta):
         return "No details"
@@ -130,50 +130,58 @@ def show_details(evt: gr.SelectData, meta):
     return "\n".join(lines)
 
 
+# ---- UI ----
+
 def build_ui():
     with gr.Blocks(title="Diffusion Studio") as app:
         gr.Markdown("# Diffusion Studio")
         gr.Markdown(f"Engine: `{ENDPOINT}` — [Swagger]({ENDPOINT}/swagger)")
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                mode = gr.Radio(["txt2img", "img2img", "edit"], value="txt2img", label="Mode")
-                prompt = gr.Textbox(label="Prompt", placeholder="Describe the image...", lines=3)
-                init_file = gr.File(label="Init Image (img2img)", file_types=["image"], visible=False)
-                edit_files = gr.File(label="Reference Images (edit)", file_types=["image"], file_count="multiple", visible=False)
-                mode.change(lambda m: (gr.update(visible=(m == "img2img")), gr.update(visible=(m == "edit"))),
-                           mode, [init_file, edit_files])
+        with gr.Tabs():
+            # --- Generate tab ---
+            with gr.Tab("Generate"):
                 with gr.Row():
-                    steps = gr.Slider(1, 25, value=4, step=1, label="Steps")
-                    width = gr.Slider(256, 2048, value=1024, step=64, label="Width")
-                with gr.Row():
-                    height = gr.Slider(256, 2048, value=1024, step=64, label="Height")
-                    seed = gr.Textbox(label="Seed", placeholder="auto")
-                submit_btn = gr.Button("Generate", variant="primary")
+                    with gr.Column(scale=1):
+                        mode = gr.Radio(["txt2img", "img2img", "edit"], value="txt2img", label="Mode")
+                        prompt = gr.Textbox(label="Prompt", placeholder="Describe the image...", lines=3)
+                        init_file = gr.File(label="Init Image (img2img)", file_types=["image"], visible=False)
+                        edit_files = gr.File(label="Reference Images (edit)", file_types=["image"], file_count="multiple", visible=False)
+                        mode.change(lambda m: (gr.update(visible=(m == "img2img")), gr.update(visible=(m == "edit"))),
+                                   mode, [init_file, edit_files])
+                        with gr.Row():
+                            steps = gr.Slider(1, 25, value=4, step=1, label="Steps")
+                            width = gr.Slider(256, 2048, value=1024, step=64, label="Width")
+                        with gr.Row():
+                            height = gr.Slider(256, 2048, value=1024, step=64, label="Height")
+                            seed = gr.Textbox(label="Seed", placeholder="auto")
+                        submit_btn = gr.Button("Generate", variant="primary")
 
-            with gr.Column(scale=1):
-                task_id = gr.Textbox(label="Task ID")
+                    with gr.Column(scale=1):
+                        task_id = gr.Textbox(label="Task ID")
+                        check_btn = gr.Button("Check Status")
+                        status = gr.Markdown("")
+                        output = gr.Image(label="Generated Image", type="pil", height=450, interactive=False)
+
+                submit_btn.click(submit, [prompt, mode, init_file, edit_files, steps, width, height, seed],
+                                 [task_id, status, output])
+                check_btn.click(check, [task_id], [status, output])
+
+            # --- History tab ---
+            with gr.Tab("History"):
                 with gr.Row():
-                    check_btn = gr.Button("Check Status")
+                    load_btn = gr.Button("Refresh")
+                    delete_tid = gr.Textbox(label="Task ID to delete", placeholder="Enter task ID")
                     delete_btn = gr.Button("Delete", variant="stop")
-                    history_btn = gr.Button("Load History")
-                status = gr.Markdown("")
-                output = gr.Image(label="Generated Image", type="pil", height=450, interactive=False)
-                details = gr.Markdown("", visible=False)
-                gallery = gr.Gallery(label="History", columns=2, height=400, object_fit="contain", interactive=False)
+                hist_status = gr.Markdown("")
+                hist_details = gr.Markdown("", visible=False)
+                hist_gallery = gr.Gallery(label="Past Images", columns=3, height=500, object_fit="contain")
+                hist_meta = gr.State([])
 
-        task_state = gr.State([])
-
-        submit_btn.click(submit, [prompt, mode, init_file, edit_files, steps, width, height, seed],
-                         [task_id, status, output])
-        check_btn.click(check, [task_id], [status, output])
-        delete_btn.click(delete_task, [task_id, gallery, task_state], [status, gallery, task_state])
-        history_btn.click(load_history, [], [gallery, task_state, status])
-        gallery.select(show_details, [task_state], [details]).then(
-            fn=lambda: gr.update(visible=True), outputs=[details]
-        )
-        output.change(lambda img, gal: (gal or []) + [(img, "")] if img else (gal or []),
-                      [output, gallery], [gallery])
+                load_btn.click(load_history, [], [hist_gallery, hist_meta, hist_status])
+                delete_btn.click(delete_from_history, [delete_tid], [hist_gallery, hist_meta, hist_status])
+                hist_gallery.select(show_details, [hist_meta], [hist_details]).then(
+                    fn=lambda: gr.update(visible=True), outputs=[hist_details]
+                )
 
     return app
 
