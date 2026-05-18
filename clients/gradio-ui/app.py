@@ -97,7 +97,7 @@ def build_ui():
                 task_id = gr.Textbox(label="Task ID")
                 check_btn = gr.Button("Check Status")
                 status = gr.Markdown("")
-                output = gr.Image(label="Generated Image", type="pil", height=450)
+                output = gr.Image(label="Generated Image", type="pil", height=450, interactive=False)
                 gallery = gr.Gallery(label="History", columns=2, height=400, object_fit="contain")
 
         submit_btn.click(submit, [prompt, mode, init_file, edit_files, steps, width, height, seed],
