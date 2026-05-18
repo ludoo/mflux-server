@@ -40,21 +40,37 @@ def submit(prompt, mode, init_images, steps, width, height, seed):
     if seed and seed.strip():
         payload["seed"] = seed.strip()
 
-    if mode == "img2img" and init_images:
-        img = init_images[0] if isinstance(init_images, list) else init_images
-        buf = io.BytesIO()
-        Image.fromarray(img).save(buf, format="PNG")
-        payload["init_image"] = base64.b64encode(buf.getvalue()).decode()
-        payload["image_strength"] = 0.4
-
-    if mode == "edit" and init_images:
-        b64_list = []
-        imgs = init_images if isinstance(init_images, list) else [init_images]
-        for img in imgs:
+    if mode in ("img2img", "edit") and init_images:
+        # Gallery returns list of (path, caption) tuples, filter out Nones
+        valid = []
+        for item in (init_images or []):
+            if item is None:
+                continue
+            # Could be (path, caption) tuple or (numpy_array, caption) tuple
+            if isinstance(item, (list, tuple)) and len(item) >= 1:
+                img_data = item[0]
+            else:
+                img_data = item
+            if img_data is None:
+                continue
+            # Convert to PIL and then base64
+            if isinstance(img_data, str):
+                pil_img = Image.open(img_data)
+            else:
+                pil_img = Image.fromarray(img_data)
             buf = io.BytesIO()
-            Image.fromarray(img).save(buf, format="PNG")
-            b64_list.append(base64.b64encode(buf.getvalue()).decode())
-        payload["init_images"] = b64_list
+            pil_img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            valid.append(b64)
+
+        if not valid:
+            return None, "No valid images uploaded", ""
+
+        if mode == "img2img":
+            payload["init_image"] = valid[0]
+            payload["image_strength"] = 0.4
+        elif mode == "edit":
+            payload["init_images"] = valid
 
     endpoint = f"{ENDPOINT}/api/edit" if mode == "edit" else f"{ENDPOINT}/api/generate"
     try:
@@ -145,7 +161,7 @@ def build_ui():
 
         # When done, add to gallery
         output_image.change(
-            fn=lambda img, gal: (gal or []) + [img] if img is not None else (gal or []),
+            fn=lambda img, gal: (gal or []) + [(img, None)] if img is not None else (gal or []),
             inputs=[output_image, gallery],
             outputs=[gallery],
         )
