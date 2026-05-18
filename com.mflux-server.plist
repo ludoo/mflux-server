@@ -17,6 +17,8 @@
         <string>FLUX.2-klein-9B-MLX-Q8</string>
         <string>--local-model</string>
         <string>flux2-klein-9b:/opt/llm/diffusion-mlx/FLUX.2-klein-9B-MLX-Q8</string>
+        <string>--local-model</string>
+        <string>flux2-klein-9b-edit:/opt/llm/diffusion-mlx/FLUX.2-klein-9B-MLX-Q8</string>
         <string>--host</string>
         <string>0.0.0.0</string>
         <string>--port</string>

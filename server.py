@@ -127,6 +127,10 @@ def _register_local_models(local_models_arg: list[str] | None) -> None:
         if key not in MODEL_REGISTRY:
             raise ValueError(f"--local-model: registry key '{key}' not found. Available: {list(MODEL_REGISTRY.keys())}")
         name = os.path.basename(path)
+        # Append mode suffix for variants so they don't collide with base entry
+        loader = MODEL_REGISTRY[key].get("loader", "")
+        if "-edit" in loader:
+            name = name + "-edit"
         MODEL_REGISTRY[name] = {
             **MODEL_REGISTRY[key],
             "_local": True,
