@@ -647,7 +647,9 @@ class GetTasks(Resource):
         tasklist0 = []
         for task in tasklist:
             task0 = task.copy()
-            if 'image' in task0: del task0['image']
+            # Strip non-serializable PIL objects
+            for key in ('image', 'init_image', 'init_images'):
+                task0.pop(key, None)
             tasklist0.append(task0)        
         return jsonify(tasklist0)
 
