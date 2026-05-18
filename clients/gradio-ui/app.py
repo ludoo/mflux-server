@@ -80,7 +80,9 @@ def load_history():
     try:
         r = requests.get(f"{ENDPOINT}/api/tasks", timeout=10)
         r.raise_for_status()
-        tasks = r.json().get("tasks", [])
+        tasks = r.json()
+        if isinstance(tasks, dict):
+            tasks = tasks.get("tasks", [])
     except requests.RequestException:
         return [], [], "Failed to load history"
 
